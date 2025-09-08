@@ -35,8 +35,23 @@ export class OpenAIService implements BytebotAgentService {
       );
     }
 
+    // Support OpenRouter or any OpenAI-compatible base via env
+    const baseURL =
+      this.configService.get<string>('OPENAI_API_BASE') ||
+      this.configService.get<string>('OPENAI_BASE_URL') ||
+      this.configService.get<string>('OPENAI_API_HOST') ||
+      undefined;
+
+    const httpReferer = this.configService.get<string>('HTTP_REFERER');
+    const xTitle = this.configService.get<string>('X_TITLE');
+
     this.openai = new OpenAI({
       apiKey: apiKey || 'dummy-key-for-initialization',
+      baseURL,
+      defaultHeaders: {
+        ...(!!httpReferer ? { 'HTTP-Referer': httpReferer } : {}),
+        ...(!!xTitle ? { 'X-Title': xTitle } : {}),
+      },
     });
   }
 
@@ -77,6 +92,51 @@ export class OpenAIService implements BytebotAgentService {
     } catch (error: any) {
       console.log('error', error);
       console.log('error name', error.name);
+
+      // Fallback: if using OpenRouter (or non-Responses-compatible provider), try Chat Completions
+      const base =
+        this.configService.get<string>('OPENAI_API_BASE') ||
+        this.configService.get<string>('OPENAI_BASE_URL') ||
+        '';
+
+      const likelyNeedsChatAPI =
+        base.includes('openrouter.ai') ||
+        (error?.status === 404) ||
+        (typeof error?.message === 'string' && /responses/i.test(error.message));
+
+      if (likelyNeedsChatAPI) {
+        try {
+          const chatMessages = this.formatMessagesForChat(messages);
+          const completion = await this.openai.chat.completions.create(
+            {
+              model,
+              messages: chatMessages as any,
+            },
+            { signal },
+          );
+
+          const text =
+            completion.choices?.[0]?.message?.content ??
+            JSON.stringify(completion.choices?.[0] ?? {});
+          return {
+            contentBlocks: [
+              {
+                type: MessageContentType.Text,
+                text,
+              } as TextContentBlock,
+            ],
+            tokenUsage: {
+              inputTokens: (completion as any).usage?.prompt_tokens || 0,
+              outputTokens: (completion as any).usage?.completion_tokens || 0,
+              totalTokens: (completion as any).usage?.total_tokens || 0,
+            },
+          };
+        } catch (fallbackErr: any) {
+          this.logger.warn(
+            `Chat Completions fallback failed: ${fallbackErr?.message || fallbackErr}`,
+          );
+        }
+      }
 
       if (error instanceof APIUserAbortError) {
         this.logger.log('OpenAI API call aborted');
@@ -237,6 +297,26 @@ export class OpenAIService implements BytebotAgentService {
     }
 
     return openaiMessages;
+  }
+
+  // Minimal mapping for Chat Completions (fallback path)
+  private formatMessagesForChat(messages: Message[]) {
+    const out: any[] = [];
+    for (const m of messages) {
+      const blocks = (m.content as MessageContentBlock[]) || [];
+      const texts = blocks
+        .filter((b) => b.type === MessageContentType.Text || (b as any).text)
+        .map((b: any) => b.text)
+        .filter(Boolean);
+
+      if (texts.length) {
+        out.push({
+          role: m.role === Role.USER ? 'user' : 'assistant',
+          content: texts.join('\n'),
+        });
+      }
+    }
+    return out;
   }
 
   private formatOpenAIResponse(
