@@ -106,25 +106,78 @@ export class OpenAIService implements BytebotAgentService {
 
       if (likelyNeedsChatAPI) {
         try {
-          const chatMessages = this.formatMessagesForChat(messages);
+          const chatMessages = this.formatMessagesForChat(messages, systemPrompt);
+
+          const chatTools = useTools
+            ? (openaiTools as any[]).map((t: any) => ({
+                type: 'function',
+                function: {
+                  name: t.name,
+                  description: t.description,
+                  parameters: t.parameters,
+                },
+              }))
+            : undefined;
+
           const completion = await this.openai.chat.completions.create(
             {
               model,
               messages: chatMessages as any,
+              tools: chatTools as any,
+              tool_choice: useTools ? 'auto' : undefined,
             },
             { signal },
           );
 
-          const text =
-            completion.choices?.[0]?.message?.content ??
-            JSON.stringify(completion.choices?.[0] ?? {});
-          return {
-            contentBlocks: [
-              {
+          const choice = completion.choices?.[0];
+          const msg: any = choice?.message;
+
+          const blocks: MessageContentBlock[] = [];
+
+          // text/content
+          if (msg?.content) {
+            const finalText =
+              typeof msg.content === 'string'
+                ? msg.content
+                : Array.isArray(msg.content)
+                ? msg.content
+                    .map((p: any) =>
+                      typeof p === 'string' ? p : p?.text || '',
+                    )
+                    .filter(Boolean)
+                    .join('\n')
+                : '';
+            if (finalText) {
+              blocks.push({
                 type: MessageContentType.Text,
-                text,
-              } as TextContentBlock,
-            ],
+                text: finalText,
+              } as TextContentBlock);
+            }
+          }
+
+          // tool calls
+          if (Array.isArray(msg?.tool_calls)) {
+            for (const tc of msg.tool_calls) {
+              const name = tc?.function?.name;
+              let args: any = {};
+              try {
+                args = tc?.function?.arguments
+                  ? JSON.parse(tc.function.arguments)
+                  : {};
+              } catch {
+                args = {};
+              }
+              blocks.push({
+                type: MessageContentType.ToolUse,
+                id: tc?.id || name || 'tool_call',
+                name,
+                input: args,
+              } as ToolUseContentBlock);
+            }
+          }
+
+          return {
+            contentBlocks: blocks,
             tokenUsage: {
               inputTokens: (completion as any).usage?.prompt_tokens || 0,
               outputTokens: (completion as any).usage?.completion_tokens || 0,
@@ -300,10 +353,18 @@ export class OpenAIService implements BytebotAgentService {
   }
 
   // Minimal mapping for Chat Completions (fallback path)
-  private formatMessagesForChat(messages: Message[]) {
+  private formatMessagesForChat(messages: Message[], systemPrompt?: string) {
     const out: any[] = [];
+
+    // prepend system instruction if provided
+    if (systemPrompt) {
+      out.push({ role: 'system', content: systemPrompt });
+    }
+
     for (const m of messages) {
       const blocks = (m.content as MessageContentBlock[]) || [];
+
+      // gather plain text parts
       const texts = blocks
         .filter((b) => b.type === MessageContentType.Text || (b as any).text)
         .map((b: any) => b.text)
@@ -314,6 +375,23 @@ export class OpenAIService implements BytebotAgentService {
           role: m.role === Role.USER ? 'user' : 'assistant',
           content: texts.join('\n'),
         });
+      }
+
+      // map tool results to role='tool' so the model can continue function calling
+      for (const b of blocks) {
+        if (b.type === MessageContentType.ToolResult) {
+          const tr = b as unknown as ToolResultContentBlock;
+          const textParts = tr.content
+            .map((c: any) =>
+              c?.type === MessageContentType.Text ? c.text : '',
+            )
+            .filter(Boolean);
+          out.push({
+            role: 'tool',
+            tool_call_id: tr.tool_use_id,
+            content: textParts.join('\n') || 'tool result',
+          });
+        }
       }
     }
     return out;
